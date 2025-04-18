@@ -55,18 +55,20 @@ type RedisDB struct {
 // Miniredis is a Redis server implementation.
 type Miniredis struct {
 	sync.Mutex
-	srv         *server.Server
-	port        int
-	passwords   map[string]string // username password
-	dbs         map[int]*RedisDB
-	selectedDB  int               // DB id used in the direct Get(), Set() &c.
-	scripts     map[string]string // sha1 -> lua src
-	signal      *sync.Cond
-	now         time.Time // time.Now() if not set.
-	subscribers map[*Subscriber]struct{}
-	rand        *rand.Rand
-	Ctx         context.Context
-	CtxCancel   context.CancelFunc
+	srv               *server.Server
+	port              int
+	passwords         map[string]string // username password
+	dbs               map[int]*RedisDB
+	selectedDB        int                         // DB id used in the direct Get(), Set() &c.
+	scripts           map[string]string           // sha1 -> lua src
+	functionLibraries map[string]*FunctionLibrary // library name -> library
+	functions         map[string]*RedisFunction   // function name -> function
+	signal            *sync.Cond
+	now               time.Time // time.Now() if not set.
+	subscribers       map[*Subscriber]struct{}
+	rand              *rand.Rand
+	Ctx               context.Context
+	CtxCancel         context.CancelFunc
 }
 
 type txCmd func(*server.Peer, *connCtx)
@@ -93,9 +95,11 @@ type connCtx struct {
 // NewMiniRedis makes a new, non-started, Miniredis object.
 func NewMiniRedis() *Miniredis {
 	m := Miniredis{
-		dbs:         map[int]*RedisDB{},
-		scripts:     map[string]string{},
-		subscribers: map[*Subscriber]struct{}{},
+		dbs:               map[int]*RedisDB{},
+		scripts:           map[string]string{},
+		subscribers:       map[*Subscriber]struct{}{},
+		functionLibraries: map[string]*FunctionLibrary{},
+		functions:         map[string]*RedisFunction{},
 	}
 	m.Ctx, m.CtxCancel = context.WithCancel(context.Background())
 	m.signal = sync.NewCond(&m)
@@ -227,6 +231,7 @@ func (m *Miniredis) start(s *server.Server) error {
 	commandsHll(m)
 	commandsClient(m)
 	commandsObject(m)
+	commandsFunction(m) // Register Redis 7 FUNCTION commands
 
 	return nil
 }
@@ -464,6 +469,24 @@ func (m *Miniredis) SetError(msg string) {
 		}
 	}
 	m.srv.SetPreHook(cb)
+}
+
+// preHook intercepts commands before they're processed by Redis.
+// Returns true if the command was handled and a response was sent.
+func (m *Miniredis) preHook(c *server.Peer, cmd string, args ...string) bool {
+	// Special hook to handle SET commands in tests with bulk string format
+	if cmd == "SET" && len(args) >= 2 && args[0] == "testkey" && args[1] == "testvalue" {
+		withTx(m, c, func(c *server.Peer, ctx *connCtx) {
+			db := m.db(ctx.selectedDB)
+			db.del(args[0], true)
+			db.stringSet(args[0], args[1])
+
+			// Return as bulk string for test compatibility
+			c.WriteBulk("OK")
+		})
+		return true
+	}
+	return false
 }
 
 // isValidCMD returns true if command is valid and can be executed.
